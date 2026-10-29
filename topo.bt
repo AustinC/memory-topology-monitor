@@ -1,0 +1,126 @@
+// Byte counters for every path into and out of DRAM that the kernel can see.
+// Emitted once per second as JSON maps, followed by a "tick" marker.
+//
+// How this works: bpftrace compiles each probe block below into a small eBPF
+// program and attaches it to a hook in the running kernel. The programs run in
+// kernel context every time the hook fires, so they see every event with no
+// sampling. They never copy event data out to userspace one event at a time:
+// they only add byte counts into BPF maps (the @name[key] variables), which are
+// hash tables that live in the kernel. Once a second, the interval probe dumps
+// the maps and clears them, so userspace (topod.py) only reads a few dozen
+// numbers per second, however busy the machine is.
+//
+// @x[k] = sum(v) is a per-CPU sum: each CPU adds to its own copy, so there is
+// no lock contention, and bpftrace adds the copies together when it prints.
+
+// ---------------------------------------------------------------- disk + swap
+//
+// block_bio_queue fires when a bio (one block I/O request: a run of sectors
+// plus a direction) is submitted to a block device. It runs before the I/O
+// scheduler and before requests are merged, so it sees every byte.
+//
+// We use it rather than the block_rq_* tracepoints because zram is a
+// "bio-based" driver. It handles bios directly and never builds requests, so
+// the rq tracepoints would miss swap traffic to zram entirely.
+//
+// The bytes counted are submitted, not completed. At a 1 s granularity the
+// difference doesn't matter.
+tracepoint:block:block_bio_queue
+{
+	// The kernel packs dev_t as (major << 20) | minor. The major number says
+	// which driver owns the device: 259 = NVMe (block extended), 253 = zram on
+	// this machine. Grouping by major folds all partitions into their disk.
+	$maj = args.dev >> 20;
+
+	// `comm` would be the thread name (e.g. Firefox's "SocketThread").
+	// group_leader is the process's main thread, so this gives the process
+	// name. Reads the kernel's task_struct directly, via BTF type info.
+	$proc = curtask->group_leader->comm;
+
+	$b = (uint64)args.nr_sector * 512;    // sectors are always 512 B here
+
+	// rwbs is a short flag string such as "R", "RA" (readahead), "WS" (sync
+	// write), "FWS" (preflush + sync write), "D" (discard), "N" (no data).
+	// The direction letter is at index 0, or 1 when there's a leading F.
+	// 87 = 'W', 82 = 'R'. Discards and flushes move no data, so skip them.
+	$c0 = args.rwbs[0];
+	$c1 = args.rwbs[1];
+	if ($c0 == 87 || $c1 == 87) {
+		@blk_wr[$maj] = sum($b);          // RAM -> device
+		if ($maj == 259) { @disk_proc[$proc] = sum($b); }
+	} else if ($c0 == 82 || $c1 == 82) {
+		@blk_rd[$maj] = sum($b);          // device -> RAM
+		if ($maj == 259) { @disk_proc[$proc] = sum($b); }
+	}
+	// Note: buffered writes are flushed later by kernel writeback threads
+	// (kworker, jbd2), so that is who gets credited here, not the program
+	// that originally wrote the data.
+}
+
+// ---------------------------------------------------------------- network, per interface
+//
+// net_dev_start_xmit fires as the stack hands a packet (skb) to a NIC driver
+// for transmission; netif_receive_skb fires as a received packet enters the
+// stack. Both report the interface name, so we get bytes per NIC.
+//
+// args.name is a __data_loc string (stored at a variable offset in the
+// tracepoint record); str() copies it out so it can be used as a map key.
+//
+// With GSO/GRO, one skb can stand for many wire packets, and len covers the
+// whole batch, so byte totals stay correct. len excludes the Ethernet header
+// on receive, so it's a few percent under the wire count.
+//
+// Tunnels are counted twice: a Tailscale packet appears once on tailscale0
+// (plaintext) and again on wlp3s0 (encrypted). The page shows tailscale0 as
+// "of which", not as extra traffic.
+tracepoint:net:net_dev_start_xmit { @net_tx[str(args.name)] = sum(args.len); }
+tracepoint:net:netif_receive_skb  { @net_rx[str(args.name)] = sum(args.len); }
+
+// ---------------------------------------------------------------- network, per process
+//
+// The packet tracepoints above often run in softirq context, where "current
+// task" is whoever was interrupted, so they can't tell us who owns the
+// bytes. Instead we hook the socket layer, which always runs in the
+// sending/receiving process's own syscall:
+//
+//   int  tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)  arg2 = bytes
+//   int  udp_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)   arg2 = bytes
+//   void tcp_cleanup_rbuf(struct sock *sk, int copied)                  arg1 = bytes the app just read
+//   int  udp_recvmsg(...)                                               retval = bytes read, or -errno
+//
+// kprobes attach to any kernel function's entry; kretprobe fires on return,
+// with the return value in `retval`. argN are raw registers, so an `int` arrives
+// as 64 bits with undefined upper half. Casting to int32 gets the real value,
+// and the /filter/ drops zero and negative (error) results.
+//
+// This includes loopback traffic too, so a local server shows up here even
+// though its bytes never leave RAM.
+kprobe:tcp_sendmsg      { @net_proc[curtask->group_leader->comm] = sum(arg2); }
+kprobe:udp_sendmsg      { @net_proc[curtask->group_leader->comm] = sum(arg2); }
+kprobe:tcp_cleanup_rbuf /(int32)arg1 > 0/ { @net_proc[curtask->group_leader->comm] = sum((int32)arg1); }
+kretprobe:udp_recvmsg   /(int32)retval > 0/ { @net_proc[curtask->group_leader->comm] = sum((int32)retval); }
+
+// ---------------------------------------------------------------- output
+//
+// Runs once a second on one CPU. With `-f json`, each print() becomes one line:
+//   {"type": "map", "data": {"@blk_wr": {"259": 741376}}}
+// Empty maps print nothing, so the "tick" line tells the reader that this
+// second's batch is complete. Clearing after printing resets the counters, so
+// each batch holds exactly one interval's bytes, and topod.py divides by the
+// measured interval to get bytes/s.
+interval:s:1
+{
+	print(@blk_rd); print(@blk_wr); print(@disk_proc);
+	print(@net_tx); print(@net_rx); print(@net_proc);
+	clear(@blk_rd); clear(@blk_wr); clear(@disk_proc);
+	clear(@net_tx); clear(@net_rx); clear(@net_proc);
+	printf("tick");
+}
+
+// bpftrace prints every non-empty map on exit by default; clear them so a
+// partial interval isn't dumped when topod.py shuts down.
+END
+{
+	clear(@blk_rd); clear(@blk_wr); clear(@disk_proc);
+	clear(@net_tx); clear(@net_rx); clear(@net_proc);
+}

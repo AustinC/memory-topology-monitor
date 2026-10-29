@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Paths</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --fg: #1b1b1f; --muted: #6b6b74; --faint: #b9b9c0;
+    --line: #e2e2e6; --in: #2f6fd6; --out: #d9792b; --both: #7a5cc4; --track: #ececef;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #111114; --panel: #18181c; --fg: #ececf0; --muted: #8d8d97; --faint: #4a4a52;
+      --line: #2a2a31; --in: #5b9bff; --out: #f0954a; --both: #a38cf0; --track: #26262c;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #111114; --panel: #18181c; --fg: #ececf0; --muted: #8d8d97; --faint: #4a4a52;
+    --line: #2a2a31; --in: #5b9bff; --out: #f0954a; --both: #a38cf0; --track: #26262c;
+  }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); }
+  body { font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; padding: 24px 16px; }
+  main { max-width: 1120px; margin: 0 auto; }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 24px; margin-bottom: 8px; }
+  h1 { font-size: 18px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); }
+  .legend { margin-left: auto; display: flex; gap: 16px; color: var(--muted); align-items: center; }
+  .sw { display: inline-block; width: 14px; height: 3px; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
+  .live { display: inline-flex; align-items: center; gap: 6px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--faint); }
+  .dot.on { background: #3fb950; }
+  svg { width: 100%; height: auto; display: block; }
+  svg text { font-family: inherit; fill: var(--fg); font-variant-numeric: tabular-nums; }
+  .node rect.box { fill: var(--panel); stroke: var(--line); }
+  .node .title { font-size: 14px; font-weight: 600; }
+  .node .meta { font-size: 11.5px; fill: var(--muted); }
+  .node.dim { opacity: 0.45; }
+  .val { font-size: 13px; font-weight: 600; }
+  .unit { font-size: 11px; fill: var(--muted); font-weight: 400; }
+  .pct { font-size: 11px; fill: var(--muted); }
+  .procs, .peak { font-size: 11px; fill: var(--muted); }
+  .idle { fill: var(--faint); font-weight: 400; }
+  .lane { stroke-linecap: round; transition: stroke-width .6s ease, opacity .6s ease; }
+  footer { color: var(--muted); margin-top: 12px; font-size: 12px; max-width: 760px; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Data paths</h1>
+    <span class="sub">bytes per second into and out of main memory</span>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--in)"></span>into DRAM</span>
+      <span><span class="sw" style="background:var(--out)"></span>out of DRAM</span>
+      <span><span class="sw" style="background:var(--both)"></span>read + write</span>
+      <span class="live"><span class="dot" id="dot"></span><span id="status">connecting</span></span>
+    </div>
+  </header>
+  <svg id="topo" viewBox="0 0 1080 680" role="img" aria-label="Live topology of data rates between DRAM and its peers"></svg>
+  <footer>
+    Line weight is log-scaled against each link's capacity (PCIe at its maximum trained rate); numbers are smoothed over ~3&nbsp;s, sparklines show the last 60&nbsp;s raw.
+    Disk and network bytes come from eBPF tracepoints (<code>block_bio_queue</code>, <code>net_dev_start_xmit</code>, <code>netif_receive_skb</code>), with process attribution from socket kprobes.
+    DRAM traffic comes from the AMD data-fabric PMU and includes CPU and iGPU. The dGPU is polled through NVML only while it is already awake.
+  </footer>
+</main>
+<script>
+const NS = 'http://www.w3.org/2000/svg';
+const svg = document.getElementById('topo');
+const el = (tag, attrs = {}, parent = svg) => {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  parent.appendChild(e);
+  return e;
+};
+
+// ---------- formatting
+function fmt(v) {
+  if (!(v >= 1000)) return null;
+  const units = ['kB/s', 'MB/s', 'GB/s'];
+  let i = 0; v /= 1000;
+  while (v >= 1000 && i < units.length - 1) { v /= 1000; i++; }
+  return [v >= 100 ? v.toFixed(0) : v >= 10 ? v.toFixed(1) : v.toFixed(2), units[i]];
+}
+const bytes = b => {
+  const u = ['B', 'KiB', 'MiB', 'GiB']; let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return (b >= 100 || i === 0 ? b.toFixed(0) : b.toFixed(1)) + ' ' + u[i];
+};
+const mbit = B => B ? Math.round(B * 8 / 1e6) : '?';
+
+// ---------- geometry
+const DRAM = { x: 440, y: 210, w: 200, h: 260 };
+const NODES = {
+  soc:  { x: 440, y: 20,  w: 200, h: 90 },
+  nvme: { x: 30,  y: 225, w: 200, h: 90 },
+  zram: { x: 30,  y: 365, w: 200, h: 90 },
+  wifi: { x: 850, y: 225, w: 200, h: 90 },
+  eth:  { x: 850, y: 365, w: 200, h: 90 },
+  dgpu: { x: 440, y: 570, w: 200, h: 90 },
+};
+
+function node(id, box) {
+  const g = el('g', { class: 'node' });
+  el('rect', { class: 'box', x: box.x, y: box.y, width: box.w, height: box.h, rx: 10 }, g);
+  const t = el('text', { class: 'title', x: box.x + 14, y: box.y + 24 }, g);
+  const lines = [0, 1, 2].map(i => el('text', { class: 'meta', x: box.x + 14, y: box.y + 44 + i * 16 }, g));
+  return { g, t, lines };
+}
+
+// A link joins a node edge to the DRAM edge. Two lanes: into DRAM and out of DRAM.
+function link(id, a, b, opts = {}) {
+  const horiz = a[1] === b[1];
+  const off = 5;
+  const perp = horiz ? [0, 1] : [1, 0];
+  const g = el('g');
+  const lanes = {};
+  const mk = (key, from, to, sign, color) => {
+    const p1 = [from[0] + perp[0] * off * sign, from[1] + perp[1] * off * sign];
+    const p2 = [to[0] + perp[0] * off * sign, to[1] + perp[1] * off * sign];
+    const line = el('line', { class: 'lane', x1: p1[0], y1: p1[1], x2: p2[0], y2: p2[1], stroke: color }, g);
+    // chevron at the destination end
+    const d = [Math.sign(p2[0] - p1[0]), Math.sign(p2[1] - p1[1])];
+    const tip = [p2[0] - d[0] * 4, p2[1] - d[1] * 4];
+    const c = el('path', {
+      d: `M${tip[0] - d[0] * 6 - d[1] * 4},${tip[1] - d[1] * 6 - d[0] * 4} L${tip[0]},${tip[1]} L${tip[0] - d[0] * 6 + d[1] * 4},${tip[1] - d[1] * 6 + d[0] * 4}`,
+      fill: 'none', stroke: color, 'stroke-width': 1.5, 'stroke-linecap': 'round', 'stroke-linejoin': 'round',
+    }, g);
+    lanes[key] = { line, chev: c, color };
+  };
+  if (opts.single) {
+    mk('both', a, b, 0, 'var(--both)');
+    lanes.both.chev.remove();
+  } else {
+    mk('in', a, b, -1, 'var(--in)');
+    mk('out', b, a, 1, 'var(--out)');
+  }
+
+  // labels + sparkline placement
+  const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+  const lab = el('g');
+  const rows = {};
+  const spark = { w: 150, h: 30 };
+  let sx, sy;
+  if (horiz) {
+    const x = mid[0] - spark.w / 2;
+    ['in', 'out'].forEach((k, i) => rows[k] = labelRow(lab, x, mid[1] - 34 + i * 16, k));
+    sx = x; sy = mid[1] + 18;
+  } else {
+    const x = mid[0] + 18;
+    (opts.single ? ['both'] : ['in', 'out']).forEach((k, i) => rows[k] = labelRow(lab, x, mid[1] - 6 + i * 16 - (opts.single ? 0 : 8), k));
+    sx = mid[0] - 18 - spark.w; sy = mid[1] - spark.h / 2;
+  }
+  const sg = el('g', { transform: `translate(${sx},${sy})` });
+  el('line', { x1: 0, x2: spark.w, y1: spark.h / 2, y2: spark.h / 2, stroke: 'var(--line)' }, sg);
+  const areaIn = el('path', { fill: opts.single ? 'var(--both)' : 'var(--in)', 'fill-opacity': 0.35, stroke: 'none' }, sg);
+  const areaOut = el('path', { fill: 'var(--out)', 'fill-opacity': 0.35, stroke: 'none' }, sg);
+  const peak = el('text', { class: 'peak', x: horiz ? 0 : spark.w, y: horiz ? spark.h + 13 : -4, 'text-anchor': horiz ? 'start' : 'end' }, sg);
+  const procs = el('text', { class: 'procs', x: horiz ? sx : mid[0] + 18, y: horiz ? sy + spark.h + 28 : mid[1] + 30 });
+  const extra = el('text', { class: 'procs', x: horiz ? sx : mid[0] + 18, y: horiz ? sy + spark.h + 42 : mid[1] + 44 });
+
+  return { id, lanes, rows, spark, areaIn, areaOut, peak, procs, extra, single: !!opts.single,
+           hist: { in: [], out: [] }, ewma: { in: 0, out: 0 }, procAcc: [] };
+}
+
+function labelRow(parent, x, y, kind) {
+  const t = el('text', { x, y }, parent);
+  const glyph = { in: '▸ ', out: '◂ ', both: '' }[kind];
+  const g = el('tspan', { fill: `var(--${kind})`, 'font-size': 10 }, t); g.textContent = glyph;
+  const v = el('tspan', { class: 'val' }, t);
+  const u = el('tspan', { class: 'unit', dx: 3 }, t);
+  const p = el('tspan', { class: 'pct', dx: 8 }, t);
+  return { v, u, p, kind };
+}
+
+// ---------- build static picture
+const dramG = el('g', { class: 'node' });
+el('rect', { class: 'box', x: DRAM.x, y: DRAM.y, width: DRAM.w, height: DRAM.h, rx: 12, 'stroke-width': 1.5 }, dramG);
+el('text', { class: 'title', x: DRAM.x + 16, y: DRAM.y + 28 }, dramG).textContent = 'DRAM';
+const dramSize = el('text', { class: 'meta', x: DRAM.x + DRAM.w - 16, y: DRAM.y + 28, 'text-anchor': 'end' }, dramG);
+const memBar = { x: DRAM.x + 16, y: DRAM.y + 46, w: DRAM.w - 32, h: 8 };
+el('rect', { x: memBar.x, y: memBar.y, width: memBar.w, height: memBar.h, rx: 2, fill: 'var(--track)' }, dramG);
+const barUsed = el('rect', { x: memBar.x, y: memBar.y, height: memBar.h, rx: 2, fill: 'var(--fg)', 'fill-opacity': 0.75 }, dramG);
+const barCache = el('rect', { y: memBar.y, height: memBar.h, fill: 'var(--fg)', 'fill-opacity': 0.25 }, dramG);
+const dramLines = [0, 1, 2, 3, 4, 5].map(i => el('text', { class: 'meta', x: DRAM.x + 16, y: DRAM.y + 78 + i * 18 }, dramG));
+
+const N = Object.fromEntries(Object.entries(NODES).map(([k, b]) => [k, node(k, b)]));
+const L = {
+  soc:  link('soc',  [540, 110], [540, 210], { single: true }),
+  nvme: link('nvme', [230, 270], [440, 270]),
+  zram: link('zram', [230, 410], [440, 410]),
+  wifi: link('wifi', [850, 270], [640, 270]),
+  eth:  link('eth',  [850, 410], [640, 410]),
+  dgpu: link('dgpu', [540, 570], [540, 470]),
+};
+// hide the unused second row on single-lane links
+// (the SoC link counts reads and writes together; the data fabric does not split them)
+
+// ---------- update
+const TAU = 3;                       // seconds, display smoothing
+const A = 1 - Math.exp(-1 / TAU);
+const HIST = 60;
+
+function widthFor(v, cap) {
+  if (!(v >= 1000)) return 1;
+  const top = Math.log10(Math.max(cap || 1e9, 1e4) / 1e3);
+  const f = Math.min(1, Math.log10(v / 1e3) / top);
+  return 1.25 + 6 * f;
+}
+
+function setRow(row, v, cap) {
+  const f = fmt(v);
+  if (!f) { row.v.textContent = 'idle'; row.v.setAttribute('class', 'val idle'); row.u.textContent = ''; row.p.textContent = ''; return; }
+  row.v.setAttribute('class', 'val');
+  row.v.textContent = f[0]; row.u.textContent = f[1];
+  const pct = cap ? v / cap * 100 : 0;
+  row.p.textContent = pct >= 1 ? `${pct.toFixed(0)}% of link` : '';
+}
+
+function sparkPath(vals, max, h, dir) {
+  if (!vals.length) return '';
+  const w = 150, n = HIST, step = w / (n - 1), mid = h / 2;
+  const x0 = w - (vals.length - 1) * step;
+  let d = `M${x0},${mid}`;
+  vals.forEach((v, i) => { d += ` L${x0 + i * step},${mid - dir * Math.min(1, v / max) * (mid - 1)}`; });
+  return d + ` L${w},${mid} Z`;
+}
+
+function updateLink(lk, vin, vout, caps, procs, extraText) {
+  const live = vin != null;
+  for (const [k, v] of [['in', vin], ['out', vout]]) {
+    if (k === 'out' && lk.single) continue;
+    const raw = v || 0;
+    lk.ewma[k] = lk.ewma[k] === 0 ? raw : lk.ewma[k] + A * (raw - lk.ewma[k]);
+    lk.hist[k].push(raw); if (lk.hist[k].length > HIST) lk.hist[k].shift();
+    const lane = lk.lanes[lk.single ? 'both' : k];
+    const cap = caps[k];
+    const w = widthFor(lk.ewma[k], cap);
+    lane.line.setAttribute('stroke-width', w);
+    const active = live && lk.ewma[k] >= 1000;
+    lane.line.setAttribute('stroke', active ? lane.color : 'var(--faint)');
+    lane.line.setAttribute('stroke-dasharray', live ? 'none' : '2 4');
+    lane.line.style.opacity = active ? 1 : 0.6;
+    if (lane.chev.isConnected) lane.chev.setAttribute('stroke', active ? lane.color : 'var(--faint)');
+    setRow(lk.rows[lk.single ? 'both' : k], live ? lk.ewma[k] : 0, cap);
+  }
+  const all = [...lk.hist.in, ...lk.hist.out];
+  const max = Math.max(1e4, ...all);
+  lk.areaIn.setAttribute('d', sparkPath(lk.hist.in, max, lk.spark.h, 1));
+  lk.areaOut.setAttribute('d', lk.single ? '' : sparkPath(lk.hist.out, max, lk.spark.h, -1));
+  const pf = fmt(Math.max(...all, 0));
+  lk.peak.textContent = pf ? `60 s peak ${pf[0]} ${pf[1]}` : '';
+
+  // process attribution: accumulate the last 5 s so the names don't flicker
+  lk.procAcc.push(procs || {}); if (lk.procAcc.length > 5) lk.procAcc.shift();
+  const tot = {};
+  lk.procAcc.forEach(p => Object.entries(p).forEach(([k, v]) => { k = procName(k); tot[k] = (tot[k] || 0) + v; }));
+  const sum = Object.values(tot).reduce((a, b) => a + b, 0);
+  const top = Object.entries(tot).sort((a, b) => b[1] - a[1]).filter(([, v]) => v / sum >= 0.15).slice(0, 2);
+  lk.procs.textContent = sum / lk.procAcc.length >= 20e3 && top.length
+    ? top.map(([k, v]) => `${k} ${Math.round(v / sum * 100)}%`).join(' · ') : '';
+  lk.extra.textContent = extraText || '';
+}
+
+// Kernel threads do I/O on behalf of others; give them names that say what they are.
+function procName(c) {
+  if (/^kworker/.test(c)) return 'kernel writeback';
+  if (/^jbd2/.test(c)) return 'ext4 journal';
+  return c;
+}
+
+let lastCpu = null;
+function render(s) {
+  // SoC
+  let cpuPct = null;
+  if (s.cpu_jiffies) {
+    const j = s.cpu_jiffies, idle = j[3] + j[4], total = j.reduce((a, b) => a + b, 0);
+    if (!lastCpu || total !== lastCpu.total) {
+      if (lastCpu) lastCpu.pct = 100 * (1 - (idle - lastCpu.idle) / (total - lastCpu.total));
+      lastCpu = { idle, total, pct: lastCpu && lastCpu.pct };
+    }
+    cpuPct = lastCpu.pct ?? null;
+  }
+  N.soc.t.textContent = s.cpu_model || 'CPU';
+  N.soc.lines[0].textContent = `cores ${cpuPct == null ? '…' : Math.round(cpuPct) + '%'} busy`;
+  if (s.igpu) N.soc.lines[1].textContent = `Radeon iGPU ${s.igpu.busy}% busy · ${bytes(s.igpu.vram_total)} carve-out`;
+  const dram = s.dram || {};
+  updateLink(L.soc, dram.bw ?? null, null, { in: dram.peak }, null, '');
+
+  // DRAM
+  if (s.mem) {
+    const m = s.mem, used = m.total - m.avail;
+    dramSize.textContent = bytes(m.total);
+    const sc = memBar.w / m.total;
+    barUsed.setAttribute('width', used * sc);
+    barCache.setAttribute('x', memBar.x + used * sc);
+    barCache.setAttribute('width', Math.min(m.cache, m.avail) * sc);
+    dramLines[0].textContent = `${bytes(used)} in use`;
+    dramLines[1].textContent = `${bytes(m.cache)} page cache`;
+    dramLines[2].textContent = `${bytes(m.avail)} available`;
+    dramLines[3].textContent = dram.peak ? `bus limit ${(dram.peak / 1e9).toFixed(1)} GB/s` : '';
+    dramLines[4].textContent = `swap in use ${bytes(m.swap_used)}`;
+  }
+
+  // NVMe
+  N.nvme.t.textContent = 'NVMe SSD';
+  N.nvme.lines[0].textContent = s.nvme_model || '';
+  const nl = s.nvme_link;
+  if (nl) N.nvme.lines[1].textContent = `PCIe ${nl.gts} GT/s ×${nl.width} · ${(nl.cap / 1e9).toFixed(1)} GB/s`;
+  const nv = s.nvme;
+  updateLink(L.nvme, nv ? nv.in : null, nv && nv.out, { in: nl && nl.cap, out: nl && nl.cap }, nv && nv.procs);
+
+  // zram
+  N.zram.t.textContent = 'zram swap';
+  N.zram.lines[0].textContent = 'compressed, lives in DRAM';
+  const zs = s.zram_stat;
+  if (zs) N.zram.lines[1].textContent = zs.orig ? `${bytes(zs.orig)} → ${bytes(zs.compr)} (${(zs.orig / zs.compr).toFixed(1)}×)` : 'empty';
+  const zr = s.zram;
+  updateLink(L.zram, zr ? zr.in : null, zr && zr.out, { in: 4e9, out: 4e9 }, null,
+             zr && (zr.in + zr.out) > 0 ? 'in = swap-in, out = swap-out' : '');
+
+  // network
+  const net = s.net || { rx: {}, tx: {}, procs: {} };
+  const wifi = s.wifi || {};
+  N.wifi.t.textContent = 'Wi-Fi';
+  const assoc = wifi.associated ?? !!wifi.rx;
+  N.wifi.lines[0].textContent = assoc ? 'wlp3s0' : 'wlp3s0 · not associated';
+  N.wifi.lines[1].textContent = wifi.rx ? `PHY ↓${mbit(wifi.rx)} ↑${mbit(wifi.tx)} Mb/s` : '';
+  N.wifi.g.classList.toggle('dim', !assoc);
+  const ts = (net.rx.tailscale0 || 0) + (net.tx.tailscale0 || 0);
+  const tsF = fmt(ts);
+  updateLink(L.wifi, s.net ? net.rx.wlp3s0 || 0 : null, net.tx.wlp3s0 || 0, { in: wifi.rx, out: wifi.tx },
+             net.procs, tsF ? `tailscale tunnel ${tsF[0]} ${tsF[1]}` : '');
+
+  const eth = s.eth || {};
+  N.eth.t.textContent = 'Ethernet';
+  N.eth.lines[0].textContent = eth.up ? `eno1 · ${mbit(eth.speed)} Mb/s` : 'eno1 · no carrier';
+  N.eth.g.classList.toggle('dim', !eth.up);
+  updateLink(L.eth, eth.up && s.net ? net.rx.eno1 || 0 : null, net.tx.eno1 || 0, { in: eth.speed, out: eth.speed }, null);
+
+  // dGPU
+  const g = s.dgpu || {};
+  N.dgpu.t.textContent = 'GeForce RTX 5050';
+  const asleep = g.status === 'suspended';
+  N.dgpu.g.classList.toggle('dim', asleep);
+  N.dgpu.lines[0].textContent = asleep ? 'asleep (runtime-suspended)'
+    : g.vram_total ? `VRAM ${bytes(g.vram_used)} / ${bytes(g.vram_total)}` : 'awake, idle (not polled)';
+  N.dgpu.lines[1].textContent = g.link ? `PCIe ${g.link.gts} GT/s ×${g.link.width}` + (g.util != null && !asleep ? ` · ${g.util}% busy` : '') : '';
+  const gl = g.in != null;
+  updateLink(L.dgpu, gl ? g.in : null, g.out, { in: g.link && g.link.cap, out: g.link && g.link.cap }, null,
+             asleep ? '' : '');
+}
+
+// ---------- stream
+const dot = document.getElementById('dot'), status = document.getElementById('status');
+function connect() {
+  const es = new EventSource('/events');
+  es.onopen = () => { dot.classList.add('on'); status.textContent = 'live'; };
+  es.onmessage = e => render(JSON.parse(e.data));
+  es.onerror = () => { dot.classList.remove('on'); status.textContent = 'reconnecting'; };
+}
+connect();
+</script>
+</body>
+</html>
