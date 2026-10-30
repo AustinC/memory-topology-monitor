@@ -9,6 +9,8 @@ Sources:
 
 Run as root:  sudo python3 topod.py   then open http://127.0.0.1:8787
 
+The disk, GPUs and network interfaces are detected at startup (detect_hardware).
+
 Structure: one thread per data source, each writing its own key in the shared
 `state` dict. A publisher thread wakes once a second and every connected
 browser gets a JSON snapshot of `state` over Server-Sent Events. The sources
@@ -20,16 +22,13 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.environ.get('PORT', 8787))
-# Block device major numbers (see /proc/devices): 259 = blkext, used by NVMe; 253 = zram.
-NVME_MAJOR, ZRAM_MAJOR = 259, 253
-# PCI addresses from `lspci`; these are specific to this laptop.
-DGPU_PCI = '0000:01:00.0'
-NVME_PCI = '0000:04:00.0'
 
 # Shared snapshot of everything we know, plus a condition variable that both
 # guards it and lets the SSE handlers sleep until the next publish.
 state = {}
 cond = threading.Condition()
+# What this machine has; filled in by detect_hardware() before the threads start.
+HW = {}
 
 
 def read(path, default=None):
@@ -41,6 +40,85 @@ def read(path, default=None):
         return default
 
 
+# ---------------------------------------------------------------- hardware detection
+#
+# Everything here comes from sysfs, which describes devices without touching
+# them, so detection can't wake a sleeping GPU.
+
+def block_major(dev):
+    """Major number of a block device; /sys/block/<dev>/dev reads like "259:0"."""
+    return int(read(f'/sys/block/{dev}/dev', '0:0').split(':')[0])
+
+
+def pci_address(path):
+    """The PCI device a sysfs path hangs off: the last address in its resolved path, if any."""
+    found = re.findall(r'[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]', os.path.realpath(path))
+    return found[-1] if found else None
+
+
+def detect_disk():
+    """The main disk: the largest fixed physical one. Other disks aren't shown."""
+    # Only real hardware has a device/ link, which rules out loop, zram and dm-* devices.
+    disks = [d for d in os.listdir('/sys/block')
+             if os.path.exists(f'/sys/block/{d}/device') and read(f'/sys/block/{d}/removable') == '0']
+    disk = max(disks, key=lambda d: int(read(f'/sys/block/{d}/size', '0')), default=None)
+    if disk is None:
+        return {'disk': None, 'disk_major': 0, 'disk_pci': None, 'disk_kind': None, 'disk_model': None}
+    if disk.startswith('nvme'):
+        kind = 'NVMe SSD'
+    elif disk.startswith('mmcblk'):
+        kind = 'eMMC / SD'
+    else:
+        kind = 'Hard disk' if read(f'/sys/block/{disk}/queue/rotational') == '1' else 'SSD'
+    # Only NVMe sits directly on a PCIe link of its own. A SATA disk's PCI ancestor
+    # is the shared controller, whose link speed says nothing about the disk.
+    return {'disk': disk, 'disk_major': block_major(disk), 'disk_kind': kind,
+            'disk_pci': pci_address(f'/sys/block/{disk}') if disk.startswith('nvme') else None,
+            'disk_model': read(f'/sys/block/{disk}/device/model', disk)}
+
+
+def detect_dgpu():
+    """PCI address and model of the first NVIDIA GPU (vendor 0x10de, display class 0x03)."""
+    for addr in sorted(os.listdir('/sys/bus/pci/devices')):
+        dev = f'/sys/bus/pci/devices/{addr}'
+        if read(f'{dev}/vendor') == '0x10de' and (read(f'{dev}/class') or '').startswith('0x03'):
+            # The NVIDIA driver publishes the model here without waking the card.
+            info = read(f'/proc/driver/nvidia/gpus/{addr}/information', '')
+            model = re.search(r'Model:\s*(.*)', info)
+            name = model.group(1).replace('NVIDIA ', '') if model else 'NVIDIA GPU'
+            return {'dgpu_pci': addr, 'dgpu_name': re.sub(r' Laptop GPU$', '', name)}
+    return {'dgpu_pci': None, 'dgpu_name': None}
+
+
+def detect_net():
+    """Sort interfaces into Wi-Fi, wired and tunnels, preferring ones with a live link."""
+    wifi, eth, tunnels = [], [], []
+    for dev in sorted(os.listdir('/sys/class/net')):
+        base = f'/sys/class/net/{dev}'
+        if os.path.isdir(f'{base}/wireless'):
+            wifi.append(dev)
+        elif read(f'{base}/type') == '65534':       # ARPHRD_NONE: tun devices and WireGuard
+            tunnels.append(dev)
+        elif read(f'{base}/type') == '1' and os.path.exists(f'{base}/device'):
+            eth.append(dev)                         # no device/ link: veth, bridge, docker0
+    live = lambda dev: read(f'/sys/class/net/{dev}/carrier') == '1'
+    return {'wifi': max(wifi, key=live, default=None), 'eth': max(eth, key=live, default=None), 'tunnels': tunnels}
+
+
+def detect_hardware():
+    # zram is a virtual device, so it isn't picked up as a disk. Its major is assigned at boot.
+    zram = next((d for d in sorted(os.listdir('/sys/block')) if d.startswith('zram')), None)
+    return {**detect_disk(), **detect_dgpu(), **detect_net(),
+            'zram': zram, 'zram_major': block_major(zram) if zram else None}
+
+
+def describe_hardware():
+    """One line per device, printed at startup so a wrong guess is easy to spot."""
+    return '\n'.join(f'  {label:<8} {value or "none"}' for label, value in (
+        ('disk', HW['disk']), ('zram', HW['zram']), ('dGPU', HW['dgpu_name']), ('Wi-Fi', HW['wifi']),
+        ('Ethernet', HW['eth']), ('tunnels', ', '.join(HW['tunnels']))))
+
+
 # ---------------------------------------------------------------- eBPF
 #
 # bpftrace does the kernel-side work (see topo.bt); we just run it as a child
@@ -48,7 +126,7 @@ def read(path, default=None):
 # even though stdout is a pipe, -q drops the "Attaching N probes" banner.
 
 def ebpf_loop():
-    proc = subprocess.Popen(['bpftrace', '-q', '-B', 'line', '-f', 'json', os.path.join(HERE, 'topo.bt')],
+    proc = subprocess.Popen(['bpftrace', '-q', '-B', 'line', '-f', 'json', os.path.join(HERE, 'topo.bt'), str(HW['disk_major'])],
                             stdout=subprocess.PIPE, text=True)
     # One batch = the map lines between two "tick" markers. Collect them, then
     # turn byte counts into bytes/s using the actually-elapsed time, which is
@@ -66,14 +144,21 @@ def ebpf_loop():
             dt, last = now - last, now
             rate = lambda name: {k: v / dt for k, v in maps.get(name, {}).items()}
             rd, wr = rate('@blk_rd'), rate('@blk_wr')
+            rx, tx = rate('@net_rx'), rate('@net_tx')
+            iface = lambda dev: {'in': rx.get(dev, 0), 'out': tx.get(dev, 0)} if dev else None
+            wifi, eth = iface(HW['wifi']), iface(HW['eth'])
+            total = lambda link: link['in'] + link['out'] if link else 0
             # JSON object keys are strings, so the integer map keys arrive as "259".
             # Direction is from DRAM's point of view: a disk read brings data
             # "in" to RAM, a write sends it "out".
             with cond:
-                state['nvme'] = {'in': rd.get(str(NVME_MAJOR), 0), 'out': wr.get(str(NVME_MAJOR), 0),
-                                 'procs': rate('@disk_proc')}
-                state['zram'] = {'in': rd.get(str(ZRAM_MAJOR), 0), 'out': wr.get(str(ZRAM_MAJOR), 0)}
-                state['net'] = {'rx': rate('@net_rx'), 'tx': rate('@net_tx'), 'procs': rate('@net_proc')}
+                state['disk'] = {'in': rd.get(str(HW['disk_major']), 0), 'out': wr.get(str(HW['disk_major']), 0),
+                                 'procs': rate('@disk_proc')} if HW['disk'] else None
+                state['zram'] = {'in': rd.get(str(HW['zram_major']), 0), 'out': wr.get(str(HW['zram_major']), 0)} if HW['zram'] else None
+                # Socket bytes aren't tied to an interface, so they're credited to the busier one.
+                state['net'] = {'wifi': wifi, 'eth': eth, 'procs': rate('@net_proc'),
+                                'procs_on': 'eth' if total(eth) > total(wifi) else 'wifi',
+                                'tun': sum(rx.get(t, 0) + tx.get(t, 0) for t in HW['tunnels'])}
             maps = {}
     # Without bpftrace, most of the picture is gone; exit the whole process
     # (sys.exit in a thread would only end this thread).
@@ -96,8 +181,21 @@ class PerfAttr(ctypes.Structure):
                 ('config', ctypes.c_uint64), ('pad', ctypes.c_uint8 * 112)]
 
 
+def dram_counters_supported():
+    """The event codes below are for Zen 2 and Zen 3. Elsewhere they'd count something else."""
+    info = read('/proc/cpuinfo', '')
+    field = lambda name: (re.search(rf'^{name}\s*: (.*)$', info, re.M) or [None, ''])[1]
+    if field('vendor_id') != 'AuthenticAMD':
+        return False
+    family, model = int(field('cpu family') or 0), int(field('model') or 0)
+    # Family 25 (0x19) mixes Zen 3 and Zen 4; these model ranges are the Zen 3 ones.
+    return (family == 23 and model >= 0x30) or (family == 25 and model >> 4 in (0x0, 0x2, 0x4, 0x5))
+
+
 def dram_loop():
-    subprocess.run(['modprobe', 'amd_uncore'], check=False)
+    if not dram_counters_supported():
+        return
+    subprocess.run(['modprobe', 'amd_uncore'], check=False, capture_output=True)
     # Dynamic PMUs get a type number at runtime; perf_event_attr.type must match it.
     pmu_type = read('/sys/bus/event_source/devices/amd_df/type')
     if pmu_type is None:
@@ -139,7 +237,7 @@ def dram_peak():
     #   0x20  Configured Memory Speed (MT/s, WORD; 0xFFFF = see 0x58)
     #   0x58  Extended Configured Memory Speed (MT/s, DWORD, SMBIOS 3.3+)
     total, base = 0, '/sys/firmware/dmi/entries'
-    for e in os.listdir(base):
+    for e in os.listdir(base) if os.path.isdir(base) else []:
         if not e.startswith('17-'):
             continue
         raw = open(f'{base}/{e}/raw', 'rb').read()
@@ -176,18 +274,20 @@ class NvUtil(ctypes.Structure):
 
 
 def dgpu_loop():
+    if not HW['dgpu_pci']:
+        return
     try:
         nv = ctypes.CDLL('libnvidia-ml.so.1')
     except OSError:
-        return
-    pm = f'/sys/bus/pci/devices/{DGPU_PCI}/power/runtime_status'  # "active" or "suspended"
+        nv = None      # still show the card's power state and link
+    pm = f'/sys/bus/pci/devices/{HW["dgpu_pci"]}/power/runtime_status'  # "active" or "suspended"
     quiet, backoff_until = 0, 0
     while True:
         status = read(pm, 'unknown')
-        info = {'status': status}
+        info = {'status': status, 'name': HW['dgpu_name']}
         # Opening NVML resets the runtime-PM idle timer. If the GPU has been doing nothing,
         # stop asking for a while so it can fall back into D3cold.
-        if status == 'active' and time.monotonic() >= backoff_until and nv.nvmlInit_v2() == 0:
+        if nv and status == 'active' and time.monotonic() >= backoff_until and nv.nvmlInit_v2() == 0:
             # Init and shut down on every poll rather than holding NVML open:
             # an open handle keeps the device awake.
             h = ctypes.c_void_p()
@@ -209,7 +309,7 @@ def dgpu_loop():
                 backoff_until, quiet = time.monotonic() + 30, 0
         elif status == 'active':
             info['status'] = 'idle'   # awake, but we're deliberately not asking
-        info['link'] = pcie_link(DGPU_PCI)
+        info['link'] = pcie_link(HW['dgpu_pci'])
         with cond:
             state['dgpu'] = info
         time.sleep(1)
@@ -217,6 +317,8 @@ def dgpu_loop():
 
 def pcie_link(addr):
     """Current link (it downclocks when idle) and capacity at the fastest rate it can train to."""
+    if not addr:
+        return None
     dev = f'/sys/bus/pci/devices/{addr}'
     gt = lambda f: float((read(f'{dev}/{f}', '') or '0').split()[0])   # "16.0 GT/s PCIe" -> 16.0
     # A link runs at the speed of its slower end. The device's parent in sysfs
@@ -238,6 +340,8 @@ def pcie_link(addr):
 
 def wifi_bitrate(dev):
     """Negotiated PHY rates from `iw` (needs root). The real throughput limit is well below these."""
+    if not dev:
+        return None
     try:
         out = subprocess.run(['iw', 'dev', dev, 'link'], capture_output=True, text=True).stdout
     except OSError:
@@ -246,7 +350,7 @@ def wifi_bitrate(dev):
     tx = re.search(r'tx bitrate: ([\d.]+) MBit', out)
     return {'rx': float(rx.group(1)) * 1e6 / 8 if rx else None,
             'tx': float(tx.group(1)) * 1e6 / 8 if tx else None,
-            'associated': out.startswith('Connected to')}
+            'associated': out.startswith('Connected to'), 'dev': dev}
 
 
 def context_loop():
@@ -255,7 +359,7 @@ def context_loop():
         mi = dict(re.findall(r'(\w+):\s+(\d+)', read('/proc/meminfo', '')))
         kb = lambda k: int(mi.get(k, 0)) * 1024
         # zram mm_stat: orig_data_size compr_data_size mem_used_total ... (bytes)
-        mm = (read('/sys/block/zram0/mm_stat', '') or '0 0').split()
+        mm = (read(f'/sys/block/{HW["zram"]}/mm_stat', '') or '0 0').split()
         # First line of /proc/stat: cumulative jiffies per CPU state (user nice system idle iowait ...);
         # the page turns successive snapshots into a busy percentage.
         cpu = [int(x) for x in read('/proc/stat').split('\n')[0].split()[1:]]
@@ -263,13 +367,14 @@ def context_loop():
         igpu_card = next((c for c in os.listdir('/sys/class/drm') if re.fullmatch(r'card\d', c)
                           and os.path.basename(os.path.realpath(f'/sys/class/drm/{c}/device/driver')) == 'amdgpu'), None)
         dev = f'/sys/class/drm/{igpu_card}/device' if igpu_card else None
-        eth_up = read('/sys/class/net/eno1/carrier') == '1'
+        eth_up = read(f'/sys/class/net/{HW["eth"]}/carrier') == '1'
+        model = re.search(r'model name\s*: (.*)', read('/proc/cpuinfo', ''))
         with cond:
             state['mem'] = {'total': kb('MemTotal'), 'avail': kb('MemAvailable'),
                             'cache': kb('Cached'), 'swap_used': kb('SwapTotal') - kb('SwapFree')}
             state['zram_stat'] = {'orig': int(mm[0]), 'compr': int(mm[1])}
             state['cpu_jiffies'] = cpu
-            state['cpu_model'] = re.sub(r' with .*', '', re.search(r'model name\s*: (.*)', read('/proc/cpuinfo')).group(1))
+            state['cpu_model'] = re.sub(r' with .*', '', model.group(1)) if model else 'CPU'
             if dev:
                 # The iGPU has no memory of its own: "VRAM" is a carve-out of
                 # system RAM reserved by firmware, and GTT is ordinary RAM mapped
@@ -278,11 +383,13 @@ def context_loop():
                                  'vram_total': int(read(f'{dev}/mem_info_vram_total', '0')),
                                  'vram_used': int(read(f'{dev}/mem_info_vram_used', '0')),
                                  'gtt_used': int(read(f'{dev}/mem_info_gtt_used', '0'))}
-            state['nvme_link'] = pcie_link(NVME_PCI)
-            state['nvme_model'] = read('/sys/block/nvme0n1/device/model', 'NVMe')
-            state['wifi'] = wifi_bitrate('wlp3s0')
+            state['disk_link'] = pcie_link(HW['disk_pci'])
+            state['disk_model'] = HW['disk_model']
+            state['disk_kind'] = HW['disk_kind']
+            state['wifi'] = wifi_bitrate(HW['wifi'])
             # /sys/class/net/*/speed is in Mb/s, and errors out when there's no carrier.
-            state['eth'] = {'up': eth_up, 'speed': int(read('/sys/class/net/eno1/speed', '0') or 0) * 1e6 / 8 if eth_up else None}
+            state['eth'] = {'dev': HW['eth'], 'up': eth_up,
+                            'speed': int(read(f'/sys/class/net/{HW["eth"]}/speed', '0') or 0) * 1e6 / 8 if eth_up else None}
         time.sleep(2)
 
 
@@ -336,9 +443,14 @@ if __name__ == '__main__':
     # root (CAP_BPF / CAP_PERFMON in principle, root in practice).
     if os.geteuid() != 0:
         sys.exit('needs root for eBPF and the DRAM PMU: sudo python3 topod.py')
+    HW.update(detect_hardware())
     # Daemon threads: they die with the main thread on Ctrl+C.
     for fn in (ebpf_loop, dram_loop, dgpu_loop, context_loop, publisher):
         threading.Thread(target=fn, daemon=True).start()
+    print('Detected:\n' + describe_hardware(), flush=True)
     print(f'http://127.0.0.1:{PORT}', flush=True)
     # Bound to localhost only: the stream includes per-process activity.
-    ThreadingHTTPServer(('127.0.0.1', PORT), Handler).serve_forever()
+    try:
+        ThreadingHTTPServer(('127.0.0.1', PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        pass

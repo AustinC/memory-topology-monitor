@@ -303,11 +303,12 @@ function render(s) {
   }
 
   // NVMe
-  N.nvme.t.textContent = 'NVMe SSD';
-  N.nvme.lines[0].textContent = s.nvme_model || '';
-  const nl = s.nvme_link;
+  N.nvme.t.textContent = s.disk_kind || 'No disk';
+  N.nvme.g.classList.toggle('dim', !s.disk_kind);
+  N.nvme.lines[0].textContent = s.disk_model || '';
+  const nl = s.disk_link;
   if (nl) N.nvme.lines[1].textContent = `PCIe ${nl.gts} GT/s ×${nl.width} · ${(nl.cap / 1e9).toFixed(1)} GB/s`;
-  const nv = s.nvme;
+  const nv = s.disk;
   updateLink(L.nvme, nv ? nv.in : null, nv && nv.out, { in: nl && nl.cap, out: nl && nl.cap }, nv && nv.procs);
 
   // zram
@@ -315,35 +316,36 @@ function render(s) {
   N.zram.lines[0].textContent = 'compressed, lives in DRAM';
   const zs = s.zram_stat;
   if (zs) N.zram.lines[1].textContent = zs.orig ? `${bytes(zs.orig)} → ${bytes(zs.compr)} (${(zs.orig / zs.compr).toFixed(1)}×)` : 'empty';
+  N.zram.g.classList.toggle('dim', !s.zram);
   const zr = s.zram;
   updateLink(L.zram, zr ? zr.in : null, zr && zr.out, { in: 4e9, out: 4e9 }, null,
              zr && (zr.in + zr.out) > 0 ? 'in = swap-in, out = swap-out' : '');
 
   // network
-  const net = s.net || { rx: {}, tx: {}, procs: {} };
+  const net = s.net || {};
   const wifi = s.wifi || {};
   N.wifi.t.textContent = 'Wi-Fi';
-  const assoc = wifi.associated ?? !!wifi.rx;
-  N.wifi.lines[0].textContent = assoc ? 'wlp3s0' : 'wlp3s0 · not associated';
+  const assoc = wifi.associated;
+  N.wifi.lines[0].textContent = !wifi.dev ? 'none' : assoc ? wifi.dev : `${wifi.dev} · not associated`;
   N.wifi.lines[1].textContent = wifi.rx ? `PHY ↓${mbit(wifi.rx)} ↑${mbit(wifi.tx)} Mb/s` : '';
   N.wifi.g.classList.toggle('dim', !assoc);
-  const ts = (net.rx.tailscale0 || 0) + (net.tx.tailscale0 || 0);
-  const tsF = fmt(ts);
-  updateLink(L.wifi, s.net ? net.rx.wlp3s0 || 0 : null, net.tx.wlp3s0 || 0, { in: wifi.rx, out: wifi.tx },
-             net.procs, tsF ? `tailscale tunnel ${tsF[0]} ${tsF[1]}` : '');
+  const tunF = fmt(net.tun || 0);
+  updateLink(L.wifi, net.wifi ? net.wifi.in : null, net.wifi && net.wifi.out, { in: wifi.rx, out: wifi.tx },
+             net.procs_on === 'wifi' ? net.procs : null, tunF ? `tunnels ${tunF[0]} ${tunF[1]}` : '');
 
   const eth = s.eth || {};
   N.eth.t.textContent = 'Ethernet';
-  N.eth.lines[0].textContent = eth.up ? `eno1 · ${mbit(eth.speed)} Mb/s` : 'eno1 · no carrier';
+  N.eth.lines[0].textContent = !eth.dev ? 'none' : eth.up ? `${eth.dev} · ${mbit(eth.speed)} Mb/s` : `${eth.dev} · no carrier`;
   N.eth.g.classList.toggle('dim', !eth.up);
-  updateLink(L.eth, eth.up && s.net ? net.rx.eno1 || 0 : null, net.tx.eno1 || 0, { in: eth.speed, out: eth.speed }, null);
+  updateLink(L.eth, eth.up && net.eth ? net.eth.in : null, net.eth && net.eth.out, { in: eth.speed, out: eth.speed },
+             net.procs_on === 'eth' ? net.procs : null);
 
   // dGPU
   const g = s.dgpu || {};
-  N.dgpu.t.textContent = 'GeForce RTX 5050';
+  N.dgpu.t.textContent = g.name || 'No discrete GPU';
   const asleep = g.status === 'suspended';
-  N.dgpu.g.classList.toggle('dim', asleep);
-  N.dgpu.lines[0].textContent = asleep ? 'asleep (runtime-suspended)'
+  N.dgpu.g.classList.toggle('dim', asleep || !g.name);
+  N.dgpu.lines[0].textContent = !g.name ? '' : asleep ? 'asleep (runtime-suspended)'
     : g.vram_total ? `VRAM ${bytes(g.vram_used)} / ${bytes(g.vram_total)}` : 'awake, idle (not polled)';
   N.dgpu.lines[1].textContent = g.link ? `PCIe ${g.link.gts} GT/s ×${g.link.width}` + (g.util != null && !asleep ? ` · ${g.util}% busy` : '') : '';
   const gl = g.in != null;

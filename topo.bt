@@ -1,6 +1,10 @@
 // Byte counters for every path into and out of DRAM that the kernel can see.
 // Emitted once per second as JSON maps, followed by a "tick" marker.
 //
+// Usage: bpftrace topo.bt <major>
+// $1 is the block major number of the main disk, detected by topod.py. Only that
+// disk's bytes get per-process attribution.
+//
 // How this works: bpftrace compiles each probe block below into a small eBPF
 // program and attaches it to a hook in the running kernel. The programs run in
 // kernel context every time the hook fires, so they see every event with no
@@ -29,7 +33,7 @@ tracepoint:block:block_bio_queue
 {
 	// The kernel packs dev_t as (major << 20) | minor. The major number says
 	// which driver owns the device: 259 = NVMe (block extended), 253 = zram on
-	// this machine. Grouping by major folds all partitions into their disk.
+	// one laptop (zram's number is dynamic). Grouping by major folds all partitions into their disk.
 	$maj = args.dev >> 20;
 
 	// `comm` would be the thread name (e.g. Firefox's "SocketThread").
@@ -47,10 +51,10 @@ tracepoint:block:block_bio_queue
 	$c1 = args.rwbs[1];
 	if ($c0 == 87 || $c1 == 87) {
 		@blk_wr[$maj] = sum($b);          // RAM -> device
-		if ($maj == 259) { @disk_proc[$proc] = sum($b); }
+		if ($maj == $1) { @disk_proc[$proc] = sum($b); }
 	} else if ($c0 == 82 || $c1 == 82) {
 		@blk_rd[$maj] = sum($b);          // device -> RAM
-		if ($maj == 259) { @disk_proc[$proc] = sum($b); }
+		if ($maj == $1) { @disk_proc[$proc] = sum($b); }
 	}
 	// Note: buffered writes are flushed later by kernel writeback threads
 	// (kworker, jbd2), so that is who gets credited here, not the program
